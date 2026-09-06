@@ -1,0 +1,15 @@
+{
+  "name": "codex-queue-local",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node cq.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "cq": "./cq.js"
+  }
+}
