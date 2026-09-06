@@ -1,6 +1,6 @@
 # Codex Queue
 
-`cq` is a small, dependency-free queue for running Codex CLI tasks one at a time. It preserves session IDs, waits for usage-limit resets, pauses sessions that are open elsewhere, and runs a hidden background daemon.
+`cq` is a small, dependency-free queue for Codex tasks. It runs new tasks through the non-interactive CLI and dispatches explicit session tasks to the Codex App, where they remain visible and interactive.
 
 ## Requirements
 
@@ -74,12 +74,42 @@ cq add "Run all tests and fix failures"
 cq add "Run all tests and fix failures" --cwd /path/to/project
 ```
 
-Resume a specific Codex session or the latest session for the working directory:
+Dispatch to a specific Codex App session, or resume the latest session non-interactively:
 
 ```text
 cq add "Continue the analysis" --session SESSION_ID
 cq add "Continue the analysis" --last
 ```
+
+`--session ID` uses the native `codex queue` command. The Codex App owns execution, displays progress, and handles permission requests. CQ records successful handoff as `DISPATCHED`; inspect the session in the App for its final result.
+
+`--last` uses `codex exec resume --last` because the native queue command requires an explicit session ID. Use `--session ID` when App visibility or interactive approval is required.
+
+### Approval modes
+
+Choose a policy when adding a task:
+
+```text
+cq add "Deploy the change" --session SESSION_ID --approval ask
+cq add "Run the test suite" --approval auto
+cq add "Run in a disposable environment" --approval all
+```
+
+| Mode | Behavior |
+| --- | --- |
+| `ask` | Show permission requests in the Codex App. Requires an explicit `--session ID`. |
+| `auto` | Use Codex automatic approval review inside the workspace-write sandbox. This is the default. |
+| `all` | Approve everything by disabling approvals and the sandbox. Use only in an environment you are willing to give full access. |
+
+Change the policy before a task starts or is dispatched:
+
+```text
+cq edit TASK_ID --approval ask
+cq edit TASK_ID --approval auto
+cq edit TASK_ID --approval all
+```
+
+Running, dispatched, and completed tasks cannot be edited. Pause or finish them first; CQ never changes an active request's permissions underneath it.
 
 Inspect the daemon and every queued task:
 
@@ -93,9 +123,10 @@ Retry one paused or failed task, or all paused and failed tasks:
 ```text
 cq retry TASK_ID
 cq retry --all
+cq edit TASK_ID --approval ask|auto|all
 ```
 
-`retry --all` does not touch running, completed, or usage-limited tasks. A session-paused task does not block later queued tasks.
+`retry --all` does not touch running, dispatched, completed, or usage-limited tasks. A session-paused task does not block later queued tasks.
 
 Other commands:
 
@@ -114,6 +145,7 @@ The common `cq deamon` misspelling is accepted as an alias for `cq daemon`.
 | --- | --- | --- |
 | `QUEUED` | Ready to run | Nothing |
 | `RUNNING` | Codex is executing the task | Nothing |
+| `DISPATCHED` | CQ handed the message to the Codex App | Follow progress and handle permissions in the App |
 | `WAITING_QUOTA` | The account usage limit was reached | Wait; retry is automatic at the displayed time |
 | `PAUSED_SESSION` | The session is open in another Codex process | Close that Codex task, then run the displayed `cq retry TASK_ID` command |
 | `DONE` | Task completed successfully | Optionally run `cq clear-done` |
@@ -129,8 +161,11 @@ flowchart TD
     D -- No --> E[Start hidden daemon]
     D -- Yes --> F[Select next eligible task]
     E --> F
-    F --> G{New or resumed session?}
-    G --> H[Run Codex CLI]
+    F --> G{Explicit session ID?}
+    G -- Yes --> R[codex queue sends message to Codex App]
+    R --> S[DISPATCHED]
+    S --> T[View progress and handle ask-mode permissions in Codex App]
+    G -- No --> H[Run Codex CLI non-interactively]
     H --> I{Result}
     I -- Success --> J[DONE]
     I -- Usage limit --> K[Mark pending tasks WAITING_QUOTA]

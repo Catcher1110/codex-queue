@@ -7,13 +7,22 @@ import {
   pauseForSession,
   retryable,
   requeue,
+  codexInvocation,
+  parseApproval,
+  approvalArgs,
   parseRetryAt,
   parseArgs
 } from "./cq.js";
 
 assert.deepEqual(
   parseArgs(["continue", "--session", "abc", "--cwd", "."]),
-  { prompt: "continue", cwd: path.resolve("."), threadId: "abc", last: false }
+  {
+    prompt: "continue",
+    cwd: path.resolve("."),
+    threadId: "abc",
+    last: false,
+    approval: "auto"
+  }
 );
 assert.equal(parseArgs(["continue", "--last"]).last, true);
 assert.throws(
@@ -21,6 +30,13 @@ assert.throws(
   /cannot be used together/
 );
 assert.throws(() => parseArgs(["continue", "--session", "--last"]), /requires a value/);
+assert.equal(
+  parseArgs(["continue", "--session", "abc", "--approval", "ask"]).approval,
+  "ask"
+);
+assert.throws(() => parseArgs(["continue", "--approval", "ask"]), /requires --session/);
+assert.throws(() => parseApproval("invalid"), /ask, auto, or all/);
+assert.deepEqual(approvalArgs("all"), ["--dangerously-bypass-approvals-and-sandbox"]);
 
 const retryAt = parseRetryAt("usage limit reached; try again in 2 minutes");
 assert.equal(isQuotaError("usage limit reached"), true);
@@ -53,3 +69,20 @@ assert.equal(retryable(busyTask), true);
 requeue(busyTask);
 assert.deepEqual(busyTask, { status: "queued", runAfter: null, lastError: null });
 assert.equal(retryable({ status: "waiting_quota" }), false);
+
+assert.deepEqual(
+  codexInvocation({ threadId: "abc", prompt: "continue" }),
+  {
+    args: [
+      "--approve-for-me",
+      "queue",
+      "--thread",
+      "abc",
+      "--message",
+      "continue"
+    ],
+    prompt: null,
+    dispatched: true
+  }
+);
+assert.equal(codexInvocation({ last: true, prompt: "continue" }).dispatched, false);

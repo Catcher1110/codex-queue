@@ -178,6 +178,7 @@ function parseArgs(args) {
   let cwd = process.cwd();
   let threadId = null;
   let last = false;
+  let approval = "auto";
   const promptParts = [];
 
   for (let i = 0; i < args.length; i++) {
@@ -206,6 +207,11 @@ function parseArgs(args) {
       continue;
     }
 
+    if (args[i] === "--approval") {
+      approval = parseApproval(args[++i]);
+      continue;
+    }
+
     promptParts.push(args[i]);
   }
 
@@ -213,12 +219,31 @@ function parseArgs(args) {
     throw new Error("--session and --last cannot be used together");
   }
 
+  if (approval === "ask" && !threadId) {
+    throw new Error("--approval ask requires --session because exec is non-interactive");
+  }
+
   return {
     prompt: promptParts.join(" ").trim(),
     cwd: path.resolve(cwd),
     threadId,
-    last
+    last,
+    approval
   };
+}
+
+function parseApproval(value) {
+  if (!["ask", "auto", "all"].includes(value)) {
+    throw new Error("--approval must be ask, auto, or all");
+  }
+
+  return value;
+}
+
+function approvalArgs(mode = "auto") {
+  if (mode === "ask") return ["-a", "on-request"];
+  if (mode === "all") return ["--dangerously-bypass-approvals-and-sandbox"];
+  return ["--approve-for-me"];
 }
 
 function isSessionBusyError(text) {
@@ -323,50 +348,73 @@ function spawnCodex(codexPath, args, cwd) {
   });
 }
 
-function runCodex(task) {
-  return new Promise(resolve => {
-    const codexPath = findCodex();
+function codexInvocation(task) {
+  const approval = task.approval || "auto";
+  const approvalOptions = approvalArgs(approval);
 
-    let args;
-    let prompt;
+  if (task.threadId) {
+    return {
+      args: [
+        ...approvalOptions,
+        "queue",
+        "--thread",
+        task.threadId,
+        "--message",
+        task.prompt
+      ],
+      prompt: null,
+      dispatched: true
+    };
+  }
 
-    if (task.threadId || task.last) {
-      console.log(
-        task.threadId
-          ? `\nResuming Codex session: ${task.threadId}`
-          : "\nResuming the latest Codex session"
-      );
-
-      args = [
+  if (task.last) {
+    return {
+      args: [
+        ...approvalOptions,
         "exec",
         "resume",
-        ...(task.threadId ? [task.threadId] : ["--last"]),
+        "--last",
         "--json",
         "--skip-git-repo-check",
         "-"
-      ];
-
-      prompt = `
+      ],
+      prompt: `
 Continue the previously queued task from where you stopped.
 
 Original task:
 ${task.prompt}
 
 Finish the task completely.
-`;
+`,
+      dispatched: false
+    };
+  }
+
+  return {
+    args: [
+      ...approvalOptions,
+      "exec",
+      "--json",
+      "--skip-git-repo-check",
+      ...(approval === "all" ? [] : ["--sandbox", "workspace-write"]),
+      "-"
+    ],
+    prompt: task.prompt,
+    dispatched: false
+  };
+}
+
+function runCodex(task) {
+  return new Promise(resolve => {
+    const codexPath = findCodex();
+    const { args, prompt, dispatched } = codexInvocation(task);
+
+    if (task.threadId) {
+      console.log(`\nDispatching to Codex App session: ${task.threadId}`);
+    } else if (task.last) {
+      console.log("\nResuming the latest Codex session");
     } else {
       console.log("\nStarting a new Codex session");
-
-      args = [
-        "exec",
-        "--json",
-        "--skip-git-repo-check",
-        "--sandbox",
-        "workspace-write",
-        "-"
-      ];
-
-      prompt = task.prompt;
     }
 
     console.log(`Directory: ${task.cwd}`);
@@ -448,7 +496,8 @@ Finish the task completely.
       resolve({
         code: -1,
         output: stdout + "\n" + stderr + "\n" + error.message,
-        threadId
+        threadId,
+        dispatched
       });
     });
 
@@ -456,12 +505,13 @@ Finish the task completely.
       resolve({
         code,
         output: stdout + "\n" + stderr,
-        threadId
+        threadId,
+        dispatched
       });
     });
 
     child.stdin.on("error", () => {});
-    child.stdin.write(prompt);
+    if (prompt) child.stdin.write(prompt);
     child.stdin.end();
   });
 }
@@ -550,7 +600,14 @@ async function runOneTask() {
     return true;
   }
 
-  if (result.code === 0) {
+  if (result.code === 0 && result.dispatched) {
+    current.status = "dispatched";
+    current.dispatchedAt = Date.now();
+    current.runAfter = null;
+    current.lastError = null;
+
+    console.log(`\nTask dispatched to Codex App: ${current.id}`);
+  } else if (result.code === 0) {
     current.status = "done";
     current.completedAt = Date.now();
     current.runAfter = null;
@@ -673,6 +730,10 @@ function listTasks() {
       console.log("  session: last");
     }
 
+    console.log(
+      `  approval: ${task.approval || "auto"}${task.approval === "all" ? " (sandbox disabled)" : ""}`
+    );
+
     if (task.runAfter) {
       console.log(
         `  retry: ${formatDate(task.runAfter)}`
@@ -711,11 +772,11 @@ switch (command) {
       process.exit(1);
     }
 
-    const { prompt, cwd, threadId, last } = parsed;
+    const { prompt, cwd, threadId, last, approval } = parsed;
 
     if (!prompt) {
       console.error(
-        'Usage: cq add "task" [--cwd DIRECTORY] [--session ID | --last]'
+        'Usage: cq add "task" [--cwd DIRECTORY] [--session ID | --last] [--approval ask|auto|all]'
       );
 
       process.exit(1);
@@ -739,7 +800,8 @@ switch (command) {
       createdAt: Date.now(),
       runAfter: null,
       threadId,
-      last
+      last,
+      approval
     };
 
     queue.push(task);
@@ -761,6 +823,8 @@ switch (command) {
     if (threadId || last) {
       console.log(`session: ${threadId || "last"}`);
     }
+
+    console.log(`approval: ${approval}${approval === "all" ? " (sandbox disabled)" : ""}`);
 
     const pid = ensureDaemon();
     console.log(`daemon: ${pid ? `running (${pid})` : "failed to start"}`);
@@ -809,6 +873,38 @@ switch (command) {
     console.log(`Requeued: ${tasks.map(x => x.id).join(", ")}`);
     const pid = ensureDaemon();
     console.log(`daemon: ${pid ? `running (${pid})` : "failed to start"}`);
+    break;
+  }
+
+  case "edit": {
+    const queue = loadQueue();
+    const task = queue.find(x => x.id === args[0]);
+
+    if (!task) {
+      console.error(`Task not found: ${args[0] || "(missing ID)"}`);
+      process.exit(1);
+    }
+
+    if (args[1] !== "--approval" || args.length !== 3) {
+      console.error("Usage: cq edit TASK_ID --approval ask|auto|all");
+      process.exit(1);
+    }
+
+    if (["running", "dispatched", "done"].includes(task.status)) {
+      console.error(`Task ${task.id} is ${task.status} and cannot be edited`);
+      process.exit(1);
+    }
+
+    const approval = parseApproval(args[2]);
+
+    if (approval === "ask" && !task.threadId) {
+      console.error("Approval mode ask requires an explicit session ID");
+      process.exit(1);
+    }
+
+    task.approval = approval;
+    saveQueue(queue);
+    console.log(`Updated ${task.id}: approval=${approval}`);
     break;
   }
 
@@ -872,12 +968,14 @@ Commands:
   cq add "task" --cwd .
   cq add "continue task" --session SESSION_ID
   cq add "continue latest task" --last
+  cq add "review changes" --session SESSION_ID --approval ask
 
   cq list
   cq run
   cq daemon
   cq retry TASK_ID
   cq retry --all
+  cq edit TASK_ID --approval ask|auto|all
 
   cq remove TASK_ID
   cq clear-done
@@ -896,6 +994,9 @@ export {
   pauseForSession,
   retryable,
   requeue,
+  codexInvocation,
+  parseApproval,
+  approvalArgs,
   parseRetryAt,
   parseArgs
 };
