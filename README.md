@@ -140,6 +140,8 @@ cq clear-done          Remove completed tasks
 
 The common `cq deamon` misspelling is accepted as an alias for `cq daemon`.
 
+CQ reads the structured Codex account rate-limit snapshot and schedules `WAITING_QUOTA` tasks for the exhausted window's `resetsAt` time. Text parsing is used only when that snapshot is unavailable, with a ten-minute safety probe only when neither source contains a reset time.
+
 ## Task states
 
 | State | Meaning | What to do |

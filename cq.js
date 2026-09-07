@@ -98,8 +98,7 @@ function isQuotaError(text) {
  * resets in 1 hour
  * try again at 11:30 PM
  */
-function parseRetryAt(text) {
-  const now = Date.now();
+function parseRetryAt(text, now = Date.now()) {
 
   // Relative time
   const relative = text.match(
@@ -138,11 +137,15 @@ function parseRetryAt(text) {
       hour = 0;
     }
 
-    const target = new Date();
+    const target = new Date(now);
 
     target.setHours(hour, minute, 30, 0);
 
     if (target.getTime() <= now) {
+      if (now - target.getTime() < 5 * 60 * 1000) {
+        return now + 30000;
+      }
+
       target.setDate(target.getDate() + 1);
     }
 
@@ -155,7 +158,7 @@ function parseRetryAt(text) {
   );
 
   if (absolute24) {
-    const target = new Date();
+    const target = new Date(now);
 
     target.setHours(
       Number(absolute24[1]),
@@ -165,6 +168,10 @@ function parseRetryAt(text) {
     );
 
     if (target.getTime() <= now) {
+      if (now - target.getTime() < 5 * 60 * 1000) {
+        return now + 30000;
+      }
+
       target.setDate(target.getDate() + 1);
     }
 
@@ -265,7 +272,7 @@ function deferQueueForQuota(queue, retryAt) {
       task.status === "waiting_quota"
     ) {
       task.status = "waiting_quota";
-      task.runAfter = Math.max(task.runAfter || 0, retryAt);
+      task.runAfter = retryAt;
       task.lastError = "quota";
     }
   }
@@ -363,6 +370,66 @@ function spawnCodex(codexPath, args, cwd) {
   });
 }
 
+function quotaRetryAtFromSnapshot(snapshot, now = Date.now()) {
+  const limits = snapshot?.rateLimitsByLimitId?.codex || snapshot?.rateLimits;
+
+  if (!limits) return null;
+
+  const exhausted = [limits.primary, limits.secondary]
+    .filter(window => window?.usedPercent >= 100 && window.resetsAt)
+    .map(window => window.resetsAt * 1000 + 30000);
+
+  return exhausted.length ? Math.max(now + 30000, ...exhausted) : now + 30000;
+}
+
+function readQuotaRetryAt(cwd = process.cwd()) {
+  return new Promise(resolve => {
+    const child = spawnCodex(findCodex(), ["app-server", "--stdio"], cwd);
+    let buffer = "";
+    let settled = false;
+
+    const finish = retryAt => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stdin.end();
+      child.kill();
+      resolve(retryAt);
+    };
+
+    const timer = setTimeout(() => finish(null), 10000);
+
+    child.stdout.on("data", chunk => {
+      buffer += chunk.toString();
+
+      let newline;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+
+        try {
+          const message = JSON.parse(line);
+
+          if (message.id === 1 && message.result) {
+            child.stdin.write('{"method":"initialized","params":{}}\n');
+            child.stdin.write('{"id":2,"method":"account/rateLimits/read","params":null}\n');
+          } else if (message.id === 2) {
+            finish(quotaRetryAtFromSnapshot(message.result));
+          }
+        } catch {
+          // Ignore non-JSON output.
+        }
+      }
+    });
+
+    child.on("error", () => finish(null));
+    child.on("close", () => finish(null));
+    child.stdin.on("error", () => {});
+    child.stdin.write('{"id":1,"method":"initialize","params":{"clientInfo":{"name":"cq","version":"1"},"capabilities":{"experimentalApi":true}}}\n');
+  });
+}
+
 function codexInvocation(task) {
   const approval = task.approval || "auto";
   const approvalOptions = approvalArgs(approval);
@@ -378,14 +445,7 @@ function codexInvocation(task) {
         "--skip-git-repo-check",
         "-"
       ],
-      prompt: `
-Continue the queued task in this session.
-
-Task:
-${task.prompt}
-
-Finish the task completely.
-`
+      prompt: task.prompt
     };
   }
 
@@ -400,14 +460,7 @@ Finish the task completely.
         "--skip-git-repo-check",
         "-"
       ],
-      prompt: `
-Continue the previously queued task from where you stopped.
-
-Original task:
-${task.prompt}
-
-Finish the task completely.
-`,
+      prompt: task.prompt,
     };
   }
 
@@ -579,7 +632,11 @@ async function runOneTask() {
   }
 
   if (isQuotaError(result.output)) {
-    let retryAt = parseRetryAt(result.output);
+    let retryAt = await readQuotaRetryAt(current.cwd);
+
+    if (!retryAt) {
+      retryAt = parseRetryAt(result.output);
+    }
 
     // Probe again in 10 minutes when Codex provides no reset time.
     if (!retryAt) {
@@ -660,23 +717,40 @@ async function daemon() {
 
   const queue = loadQueue();
   let recovered = 0;
+  let changed = false;
 
   for (const task of queue) {
     if (task.status === "running") {
       task.status = "queued";
       recovered++;
+      changed = true;
     } else if (task.status === "dispatched") {
       pauseForSession(task);
       task.lastError = "Codex App accepted the message but did not start it";
       recovered++;
+      changed = true;
     } else if (task.status === "waiting_session") {
       pauseForSession(task);
       recovered++;
+      changed = true;
     }
   }
 
-  if (recovered) {
+  if (queue.some(task => task.status === "waiting_quota")) {
+    const retryAt = await readQuotaRetryAt();
+
+    if (retryAt) {
+      deferQueueForQuota(queue, retryAt);
+      changed = true;
+      console.log(`Quota retry synchronized: ${formatDate(retryAt)}`);
+    }
+  }
+
+  if (changed) {
     saveQueue(queue);
+  }
+
+  if (recovered) {
     console.log(`Recovered ${recovered} interrupted task(s)`);
   }
 
@@ -1035,5 +1109,6 @@ export {
   parseApproval,
   approvalArgs,
   parseRetryAt,
+  quotaRetryAtFromSnapshot,
   parseArgs
 };

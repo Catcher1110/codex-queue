@@ -12,6 +12,7 @@ import {
   parseApproval,
   approvalArgs,
   parseRetryAt,
+  quotaRetryAtFromSnapshot,
   parseArgs
 } from "./cq.js";
 
@@ -45,6 +46,36 @@ const retryAt = parseRetryAt("usage limit reached; try again in 2 minutes");
 assert.equal(isQuotaError("usage limit reached"), true);
 assert.ok(retryAt >= Date.now() + 2 * 60_000);
 assert.ok(retryAt <= Date.now() + 2 * 60_000 + 31_000);
+
+const justAfterReset = new Date(2026, 8, 7, 3, 15, 45).getTime();
+assert.equal(
+  parseRetryAt("try again at 3:15 AM", justAfterReset),
+  justAfterReset + 30000
+);
+
+const beforeMidnight = new Date(2026, 8, 7, 23, 50).getTime();
+assert.equal(
+  parseRetryAt("try again at 3:15 AM", beforeMidnight),
+  new Date(2026, 8, 8, 3, 15, 30).getTime()
+);
+
+assert.equal(
+  quotaRetryAtFromSnapshot({ rateLimits: { primary: { usedPercent: 100, resetsAt: 123 } } }, 1000),
+  153000
+);
+assert.equal(
+  quotaRetryAtFromSnapshot({ rateLimits: { primary: { usedPercent: 4, resetsAt: 123 } } }, 1000),
+  31000
+);
+
+const nextDayReset = new Date(2026, 8, 8, 3, 15).getTime();
+assert.equal(
+  quotaRetryAtFromSnapshot(
+    { rateLimits: { primary: { usedPercent: 100, resetsAt: nextDayReset / 1000 } } },
+    beforeMidnight
+  ),
+  nextDayReset + 30000
+);
 
 assert.equal(
   isSessionBusyError("thread-store conflict: already has an active writer"),
@@ -92,7 +123,7 @@ assert.deepEqual(
       "--skip-git-repo-check",
       "-"
     ],
-    prompt: "\nContinue the queued task in this session.\n\nTask:\ncontinue\n\nFinish the task completely.\n"
+    prompt: "continue"
   }
 );
 assert.match(codexInvocation({ last: true, prompt: "continue" }).prompt, /continue/);
