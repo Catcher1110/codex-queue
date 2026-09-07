@@ -1,6 +1,6 @@
 # Codex Queue
 
-`cq` is a small, dependency-free queue for Codex tasks. It runs new tasks through the non-interactive CLI and dispatches explicit session tasks to the Codex App, where they remain visible and interactive.
+`cq` is a small, dependency-free queue for non-interactive Codex tasks.
 
 ## Requirements
 
@@ -74,16 +74,14 @@ cq add "Run all tests and fix failures"
 cq add "Run all tests and fix failures" --cwd /path/to/project
 ```
 
-Dispatch to a specific Codex App session, or resume the latest session non-interactively:
+Resume a specific session or the latest session non-interactively:
 
 ```text
 cq add "Continue the analysis" --session SESSION_ID
 cq add "Continue the analysis" --last
 ```
 
-`--session ID` uses the native `codex queue` command. The Codex App owns execution, displays progress, and handles permission requests. CQ records successful handoff as `DISPATCHED`; inspect the session in the App for its final result.
-
-`--last` uses `codex exec resume --last` because the native queue command requires an explicit session ID. Use `--session ID` when App visibility or interactive approval is required.
+Both forms use `codex exec resume`. A session has one active writer, so the same session cannot be open in Codex Desktop while CQ runs it. If Desktop owns the session, CQ pauses only that task and later tasks continue.
 
 ### Approval modes
 
@@ -97,11 +95,11 @@ cq add "Run in a disposable environment" --approval all
 
 | Mode | Behavior |
 | --- | --- |
-| `ask` | Show permission requests in the Codex App. Requires an explicit `--session ID`. |
+| `ask` | Let Codex request approval. Requires an explicit `--session ID`; a hidden non-interactive run cannot be taken over in Desktop. |
 | `auto` | Use Codex automatic approval review inside the workspace-write sandbox. This is the default. |
 | `all` | Approve everything by disabling approvals and the sandbox. Use only in an environment you are willing to give full access. |
 
-Change the policy before a task starts or is dispatched:
+Change the policy before a task starts:
 
 ```text
 cq edit TASK_ID --approval ask
@@ -109,7 +107,7 @@ cq edit TASK_ID --approval auto
 cq edit TASK_ID --approval all
 ```
 
-Running, dispatched, and completed tasks cannot be edited. Pause or finish them first; CQ never changes an active request's permissions underneath it.
+Running and completed tasks cannot be edited. Pause or finish them first; CQ never changes an active request's permissions underneath it.
 
 Inspect the daemon and every queued task:
 
@@ -124,9 +122,12 @@ Retry one paused or failed task, or all paused and failed tasks:
 cq retry TASK_ID
 cq retry --all
 cq edit TASK_ID --approval ask|auto|all
+cq done TASK_ID
 ```
 
-`retry --all` does not touch running, dispatched, completed, or usage-limited tasks. A session-paused task does not block later queued tasks.
+`retry --all` does not touch running, completed, or usage-limited tasks. A session-paused task does not block later queued tasks.
+
+Use `cq done TASK_ID` when a paused task was completed manually in Codex Desktop. CQ cannot safely infer that an unrelated later turn in the same session belongs to the paused queue item.
 
 Other commands:
 
@@ -145,9 +146,8 @@ The common `cq deamon` misspelling is accepted as an alias for `cq daemon`.
 | --- | --- | --- |
 | `QUEUED` | Ready to run | Nothing |
 | `RUNNING` | Codex is executing the task | Nothing |
-| `DISPATCHED` | CQ handed the message to the Codex App | Follow progress and handle permissions in the App |
 | `WAITING_QUOTA` | The account usage limit was reached | Wait; retry is automatic at the displayed time |
-| `PAUSED_SESSION` | The session is open in another Codex process | Close that Codex task, then run the displayed `cq retry TASK_ID` command |
+| `PAUSED_SESSION` | The session is open in another Codex process | Fully quit Codex Desktop or the terminal that owns it, then run the displayed `cq retry TASK_ID` command |
 | `DONE` | Task completed successfully | Optionally run `cq clear-done` |
 | `FAILED` | Codex exited with another error | Fix the cause, then run `cq retry TASK_ID` |
 
@@ -162,9 +162,8 @@ flowchart TD
     D -- Yes --> F[Select next eligible task]
     E --> F
     F --> G{Explicit session ID?}
-    G -- Yes --> R[codex queue sends message to Codex App]
-    R --> S[DISPATCHED]
-    S --> T[View progress and handle ask-mode permissions in Codex App]
+    G -- Yes --> R[Resume the requested session non-interactively]
+    R --> H
     G -- No --> H[Run Codex CLI non-interactively]
     H --> I{Result}
     I -- Success --> J[DONE]
@@ -187,7 +186,7 @@ Run `npm link` from the `codex-queue` directory. The target project does not nee
 
 ### A session is paused
 
-`cq list` prints the session conflict and the exact retry command. Close the Codex task that currently owns that session before retrying it.
+`cq list` prints the session conflict and the exact retry command. Fully quit Codex Desktop or the terminal that owns the session before retrying it. Reopen Desktop after CQ finishes. If you need live interaction and permission prompts, run `codex resume SESSION_ID` directly instead of using the hidden queue.
 
 ### The daemon stops
 

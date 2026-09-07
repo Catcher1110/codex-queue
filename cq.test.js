@@ -7,6 +7,7 @@ import {
   pauseForSession,
   retryable,
   requeue,
+  completeTask,
   codexInvocation,
   parseApproval,
   approvalArgs,
@@ -35,6 +36,8 @@ assert.equal(
   "ask"
 );
 assert.throws(() => parseArgs(["continue", "--approval", "ask"]), /requires --session/);
+assert.throws(() => parseArgs(["“continue", "--session", "abc"]), /straight quotes/);
+assert.throws(() => parseArgs(["continue --session abc"]), /parsed as task text/);
 assert.throws(() => parseApproval("invalid"), /ask, auto, or all/);
 assert.deepEqual(approvalArgs("all"), ["--dangerously-bypass-approvals-and-sandbox"]);
 
@@ -70,19 +73,26 @@ requeue(busyTask);
 assert.deepEqual(busyTask, { status: "queued", runAfter: null, lastError: null });
 assert.equal(retryable({ status: "waiting_quota" }), false);
 
+const completedTask = { status: "paused_session", runAfter: 123, lastError: "busy" };
+completeTask(completedTask);
+assert.equal(completedTask.status, "done");
+assert.equal(completedTask.runAfter, null);
+assert.equal(completedTask.lastError, null);
+assert.ok(completedTask.completedAt);
+
 assert.deepEqual(
   codexInvocation({ threadId: "abc", prompt: "continue" }),
   {
     args: [
       "--approve-for-me",
-      "queue",
-      "--thread",
+      "exec",
+      "resume",
       "abc",
-      "--message",
-      "continue"
+      "--json",
+      "--skip-git-repo-check",
+      "-"
     ],
-    prompt: null,
-    dispatched: true
+    prompt: "\nContinue the queued task in this session.\n\nTask:\ncontinue\n\nFinish the task completely.\n"
   }
 );
-assert.equal(codexInvocation({ last: true, prompt: "continue" }).dispatched, false);
+assert.match(codexInvocation({ last: true, prompt: "continue" }).prompt, /continue/);

@@ -175,6 +175,10 @@ function parseRetryAt(text) {
 }
 
 function parseArgs(args) {
+  if (args[0]?.startsWith("“")) {
+    throw new Error('Use straight quotes: cq add "task" --session SESSION_ID');
+  }
+
   let cwd = process.cwd();
   let threadId = null;
   let last = false;
@@ -221,6 +225,10 @@ function parseArgs(args) {
 
   if (approval === "ask" && !threadId) {
     throw new Error("--approval ask requires --session because exec is non-interactive");
+  }
+
+  if (!threadId && /(?:^|\s)--session(?:\s|$)/.test(promptParts.join(" "))) {
+    throw new Error('--session was parsed as task text; use straight quotes around only the task');
   }
 
   return {
@@ -275,6 +283,13 @@ function retryable(task) {
 
 function requeue(task) {
   task.status = "queued";
+  task.runAfter = null;
+  task.lastError = null;
+}
+
+function completeTask(task) {
+  task.status = "done";
+  task.completedAt = Date.now();
   task.runAfter = null;
   task.lastError = null;
 }
@@ -356,14 +371,21 @@ function codexInvocation(task) {
     return {
       args: [
         ...approvalOptions,
-        "queue",
-        "--thread",
+        "exec",
+        "resume",
         task.threadId,
-        "--message",
-        task.prompt
+        "--json",
+        "--skip-git-repo-check",
+        "-"
       ],
-      prompt: null,
-      dispatched: true
+      prompt: `
+Continue the queued task in this session.
+
+Task:
+${task.prompt}
+
+Finish the task completely.
+`
     };
   }
 
@@ -386,7 +408,6 @@ ${task.prompt}
 
 Finish the task completely.
 `,
-      dispatched: false
     };
   }
 
@@ -400,17 +421,16 @@ Finish the task completely.
       "-"
     ],
     prompt: task.prompt,
-    dispatched: false
   };
 }
 
 function runCodex(task) {
   return new Promise(resolve => {
     const codexPath = findCodex();
-    const { args, prompt, dispatched } = codexInvocation(task);
+    const { args, prompt } = codexInvocation(task);
 
     if (task.threadId) {
-      console.log(`\nDispatching to Codex App session: ${task.threadId}`);
+      console.log(`\nResuming Codex session: ${task.threadId}`);
     } else if (task.last) {
       console.log("\nResuming the latest Codex session");
     } else {
@@ -496,8 +516,7 @@ function runCodex(task) {
       resolve({
         code: -1,
         output: stdout + "\n" + stderr + "\n" + error.message,
-        threadId,
-        dispatched
+        threadId
       });
     });
 
@@ -505,8 +524,7 @@ function runCodex(task) {
       resolve({
         code,
         output: stdout + "\n" + stderr,
-        threadId,
-        dispatched
+        threadId
       });
     });
 
@@ -600,14 +618,7 @@ async function runOneTask() {
     return true;
   }
 
-  if (result.code === 0 && result.dispatched) {
-    current.status = "dispatched";
-    current.dispatchedAt = Date.now();
-    current.runAfter = null;
-    current.lastError = null;
-
-    console.log(`\nTask dispatched to Codex App: ${current.id}`);
-  } else if (result.code === 0) {
+  if (result.code === 0) {
     current.status = "done";
     current.completedAt = Date.now();
     current.runAfter = null;
@@ -653,6 +664,10 @@ async function daemon() {
   for (const task of queue) {
     if (task.status === "running") {
       task.status = "queued";
+      recovered++;
+    } else if (task.status === "dispatched") {
+      pauseForSession(task);
+      task.lastError = "Codex App accepted the message but did not start it";
       recovered++;
     } else if (task.status === "waiting_session") {
       pauseForSession(task);
@@ -746,7 +761,7 @@ function listTasks() {
 
     if (task.status === "paused_session") {
       console.log(
-        `  action: close the Codex task using this session, then run cq retry ${task.id} (only this task is resumed)`
+        `  action: fully quit Codex Desktop or the terminal owning this session, then run cq retry ${task.id} (only this task is resumed)`
       );
     }
 
@@ -908,6 +923,26 @@ switch (command) {
     break;
   }
 
+  case "done": {
+    const queue = loadQueue();
+    const task = queue.find(x => x.id === args[0]);
+
+    if (!task) {
+      console.error(`Task not found: ${args[0] || "(missing ID)"}`);
+      process.exit(1);
+    }
+
+    if (task.status === "running") {
+      console.error(`Task ${task.id} is running and cannot be marked done`);
+      process.exit(1);
+    }
+
+    completeTask(task);
+    saveQueue(queue);
+    console.log(`Marked done: ${task.id}`);
+    break;
+  }
+
   case "remove": {
     const id = args[0];
 
@@ -976,6 +1011,7 @@ Commands:
   cq retry TASK_ID
   cq retry --all
   cq edit TASK_ID --approval ask|auto|all
+  cq done TASK_ID
 
   cq remove TASK_ID
   cq clear-done
@@ -994,6 +1030,7 @@ export {
   pauseForSession,
   retryable,
   requeue,
+  completeTask,
   codexInvocation,
   parseApproval,
   approvalArgs,
