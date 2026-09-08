@@ -4,14 +4,33 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const CQ_HOME = path.resolve(process.env.CQ_HOME || path.join(os.homedir(), ".cq"));
 const QUEUE_FILE = path.join(CQ_HOME, "queue.json");
 const DAEMON_PID_FILE = path.join(CQ_HOME, "daemon.pid");
 const DAEMON_LOG_FILE = path.join(CQ_HOME, "daemon.log");
+const DAEMON_META_FILE = path.join(CQ_HOME, "daemon.meta.json");
+const SELF_FILE = fileURLToPath(import.meta.url);
+const SOURCE_VERSION = sourceVersion();
+const QUOTA_CONTINUATION_PROMPT =
+  "Continue the unfinished work from the previous turn. Complete the original request and verify the result.";
 
 fs.mkdirSync(CQ_HOME, { recursive: true });
+
+function sourceVersion() {
+  const stat = fs.statSync(SELF_FILE);
+  return `${stat.size}:${stat.mtimeMs}`;
+}
+
+function sourceWasUpdated() {
+  try {
+    return sourceVersion() !== SOURCE_VERSION;
+  } catch {
+    return false;
+  }
+}
 
 function loadQueue() {
   if (!fs.existsSync(QUEUE_FILE)) {
@@ -261,6 +280,17 @@ function approvalArgs(mode = "auto") {
   return ["--approve-for-me"];
 }
 
+function processIsAlive(pid) {
+  if (!pid) return false;
+
+  try {
+    process.kill(Number(pid), 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function isSessionBusyError(text) {
   return /thread-store conflict|already has an active writer/i.test(text);
 }
@@ -282,6 +312,7 @@ function pauseForSession(task) {
   task.status = "paused_session";
   task.runAfter = null;
   task.lastError = "session is active in another Codex process";
+  clearWorker(task);
 }
 
 function retryable(task) {
@@ -292,6 +323,7 @@ function requeue(task) {
   task.status = "queued";
   task.runAfter = null;
   task.lastError = null;
+  clearWorker(task);
 }
 
 function completeTask(task) {
@@ -299,6 +331,26 @@ function completeTask(task) {
   task.completedAt = Date.now();
   task.runAfter = null;
   task.lastError = null;
+  task.nextPrompt = null;
+  clearWorker(task);
+}
+
+function waitForQuota(task, retryAt) {
+  task.status = "waiting_quota";
+  task.runAfter = retryAt;
+  task.lastError = "quota";
+
+  if (task.threadId) {
+    task.nextPrompt = QUOTA_CONTINUATION_PROMPT;
+  }
+
+  clearWorker(task);
+}
+
+function clearWorker(task) {
+  delete task.workerToken;
+  delete task.workerPid;
+  delete task.dispatchedAt;
 }
 
 function daemonPid() {
@@ -309,6 +361,15 @@ function daemonPid() {
     return pid;
   } catch {
     return null;
+  }
+}
+
+function daemonUsesCurrentSource(pid) {
+  try {
+    const meta = JSON.parse(fs.readFileSync(DAEMON_META_FILE, "utf8"));
+    return meta.pid === pid && meta.sourceVersion === SOURCE_VERSION;
+  } catch {
+    return false;
   }
 }
 
@@ -336,6 +397,189 @@ function ensureDaemon() {
 
   child.unref();
   return child.pid;
+}
+
+function executableOnPath(name, env = process.env) {
+  if (!name) return null;
+
+  if (path.isAbsolute(name)) {
+    return fs.existsSync(name) ? name : null;
+  }
+
+  const extensions = path.extname(name)
+    ? [""]
+    : process.platform === "win32"
+      ? (env.PATHEXT || ".EXE;.CMD;.BAT").split(";")
+      : [""];
+
+  for (const directory of (env.PATH || "").split(path.delimiter)) {
+    if (!directory) continue;
+
+    for (const extension of extensions) {
+      const candidate = path.join(directory, name + extension);
+
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return candidate;
+      } catch {
+        // Try the next PATH entry.
+      }
+    }
+  }
+
+  return null;
+}
+
+function linuxTerminalSpec(workerCommand, env = process.env) {
+  const requested = env.TERMINAL;
+  const candidates = [
+    requested,
+    "x-terminal-emulator",
+    "gnome-terminal",
+    "konsole",
+    "kitty",
+    "alacritty",
+    "xterm"
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const executable = executableOnPath(candidate, env);
+    if (!executable) continue;
+
+    const name = path.basename(executable).toLowerCase();
+    const title = workerCommand.title;
+
+    if (name.includes("gnome-terminal")) {
+      return {
+        command: executable,
+        args: ["--title", title, "--", ...workerCommand.args]
+      };
+    }
+
+    if (name.includes("konsole")) {
+      return {
+        command: executable,
+        args: ["-p", `tabtitle=${title}`, "-e", ...workerCommand.args]
+      };
+    }
+
+    if (name.includes("kitty")) {
+      return {
+        command: executable,
+        args: ["--title", title, ...workerCommand.args]
+      };
+    }
+
+    if (name.includes("alacritty")) {
+      return {
+        command: executable,
+        args: ["--title", title, "-e", ...workerCommand.args]
+      };
+    }
+
+    return {
+      command: executable,
+      args: ["-T", title, "-e", ...workerCommand.args]
+    };
+  }
+
+  return null;
+}
+
+function workerCommand(taskId, workerToken) {
+  return {
+    title: `CQ Task ${taskId}`,
+    args: [process.execPath, SELF_FILE, "__worker", taskId, workerToken]
+  };
+}
+
+function startDetached(command, args, options = {}) {
+  return new Promise(resolve => {
+    let settled = false;
+    const child = spawn(command, args, {
+      detached: true,
+      windowsHide: false,
+      stdio: "ignore",
+      ...options
+    });
+
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (value) child.unref();
+      resolve(value);
+    };
+
+    const timer = setTimeout(() => finish(child.pid || null), 500);
+    child.once("spawn", () => finish(child.pid || null));
+    child.once("error", () => finish(null));
+  });
+}
+
+async function launchVisibleWorker(taskId, workerToken, cwd) {
+  const worker = workerCommand(taskId, workerToken);
+
+  if (process.platform === "win32") {
+    const command = worker.args
+      .map(value => `"${String(value).replaceAll('"', '\\"')}"`)
+      .join(" ");
+
+    const windowsTerminal = executableOnPath("wt.exe");
+
+    if (windowsTerminal) {
+      const launched = await startDetached(
+        windowsTerminal,
+        [
+          "-w",
+          "-1",
+          "new-tab",
+          "--title",
+          worker.title,
+          "--suppressApplicationTitle",
+          process.env.ComSpec || "cmd.exe",
+          "/d",
+          "/s",
+          "/c",
+          command
+        ],
+        { cwd }
+      );
+
+      if (launched) return true;
+    }
+
+    const launched = await startDetached(
+      process.env.ComSpec || "cmd.exe",
+      ["/d", "/s", "/c", `start "${worker.title}" ${command}`],
+      { cwd }
+    );
+
+    if (launched) return true;
+  } else if (process.env.DISPLAY || process.env.WAYLAND_DISPLAY) {
+    const terminal = linuxTerminalSpec(worker);
+
+    if (terminal) {
+      const launched = await startDetached(
+        terminal.command,
+        terminal.args,
+        { cwd }
+      );
+
+      if (launched) return true;
+    }
+  }
+
+  const log = fs.openSync(DAEMON_LOG_FILE, "a");
+  const child = spawn(worker.args[0], worker.args.slice(1), {
+    cwd,
+    detached: true,
+    windowsHide: true,
+    stdio: ["ignore", log, log]
+  });
+  fs.closeSync(log);
+  child.unref();
+  return Boolean(child.pid);
 }
 
 function spawnCodex(codexPath, args, cwd) {
@@ -433,6 +677,7 @@ function readQuotaRetryAt(cwd = process.cwd()) {
 function codexInvocation(task) {
   const approval = task.approval || "auto";
   const approvalOptions = approvalArgs(approval);
+  const prompt = task.nextPrompt || task.prompt;
 
   if (task.threadId) {
     return {
@@ -445,7 +690,7 @@ function codexInvocation(task) {
         "--skip-git-repo-check",
         "-"
       ],
-      prompt: task.prompt
+      prompt
     };
   }
 
@@ -460,7 +705,7 @@ function codexInvocation(task) {
         "--skip-git-repo-check",
         "-"
       ],
-      prompt: task.prompt,
+      prompt,
     };
   }
 
@@ -473,7 +718,7 @@ function codexInvocation(task) {
       ...(approval === "all" ? [] : ["--sandbox", "workspace-write"]),
       "-"
     ],
-    prompt: task.prompt,
+    prompt,
   };
 }
 
@@ -491,7 +736,13 @@ function runCodex(task) {
     }
 
     console.log(`Directory: ${task.cwd}`);
-    console.log(`Task: ${task.prompt}\n`);
+    console.log(`Task: ${task.prompt}`);
+
+    if (task.nextPrompt) {
+      console.log(`Resume instruction: ${task.nextPrompt}`);
+    }
+
+    console.log("");
 
     const child = spawnCodex(
       codexPath,
@@ -551,6 +802,21 @@ function runCodex(task) {
               `\nCodex:\n${event.item.text}\n`
             );
           }
+
+          if (
+            event.type === "item.started" &&
+            event.item?.type === "command_execution"
+          ) {
+            console.log(`\nCommand:\n${event.item.command}\n`);
+          }
+
+          if (event.type === "turn.started") {
+            console.log("Codex turn started");
+          }
+
+          if (event.type === "turn.completed") {
+            console.log("Codex turn completed");
+          }
         } catch {
           // Ignore non-JSON output.
         }
@@ -587,26 +853,47 @@ function runCodex(task) {
   });
 }
 
-async function runOneTask() {
+async function runOneTask(taskId = null, workerToken = null) {
   let queue = loadQueue();
 
   const now = Date.now();
 
-  const task = queue.find(
-    x =>
-      (
-        x.status === "queued" ||
-        x.status === "waiting_quota"
-      ) &&
-      (!x.runAfter || x.runAfter <= now)
-  );
+  const task = taskId
+    ? queue.find(x => x.id === taskId)
+    : queue.find(
+      x =>
+        (
+          x.status === "queued" ||
+          x.status === "waiting_quota"
+        ) &&
+        (!x.runAfter || x.runAfter <= now)
+    );
 
   if (!task) {
     return false;
   }
 
+  if (taskId) {
+    if (
+      task.status !== "dispatched" ||
+      !workerToken ||
+      task.workerToken !== workerToken
+    ) {
+      console.error(`Task ${taskId} is no longer assigned to this worker`);
+      return false;
+    }
+  }
+
   task.status = "running";
   task.startedAt = Date.now();
+  task.runAfter = null;
+  task.lastError = null;
+
+  if (workerToken) {
+    task.workerPid = process.pid;
+  } else {
+    clearWorker(task);
+  }
 
   saveQueue(queue);
 
@@ -652,9 +939,7 @@ async function runOneTask() {
       );
     }
 
-    current.status = "waiting_quota";
-    current.runAfter = retryAt;
-    current.lastError = "quota";
+    waitForQuota(current, retryAt);
     deferQueueForQuota(queue, retryAt);
 
     console.log(
@@ -676,10 +961,7 @@ async function runOneTask() {
   }
 
   if (result.code === 0) {
-    current.status = "done";
-    current.completedAt = Date.now();
-    current.runAfter = null;
-    current.lastError = null;
+    completeTask(current);
 
     console.log(
       `\nTask completed: ${current.id}`
@@ -689,6 +971,7 @@ async function runOneTask() {
     current.runAfter = null;
     current.lastError =
       `Codex exit code: ${result.code}`;
+    clearWorker(current);
 
     console.log(
       `\nTask failed with exit code ${result.code}`
@@ -697,6 +980,105 @@ async function runOneTask() {
 
   saveQueue(queue);
 
+  return true;
+}
+
+function eligibleTask(queue, now = Date.now()) {
+  return queue.find(
+    task =>
+      (
+        task.status === "queued" ||
+        task.status === "waiting_quota"
+      ) &&
+      (!task.runAfter || task.runAfter <= now)
+  );
+}
+
+async function waitForWorker(taskId, workerToken) {
+  while (true) {
+    const queue = loadQueue();
+    const task = queue.find(item => item.id === taskId);
+
+    if (
+      !task ||
+      task.workerToken !== workerToken ||
+      !["dispatched", "running"].includes(task.status)
+    ) {
+      return;
+    }
+
+    if (
+      task.status === "dispatched" &&
+      Date.now() - task.dispatchedAt > 30000
+    ) {
+      task.status = "failed";
+      task.lastError = "visible task terminal did not start";
+      clearWorker(task);
+      saveQueue(queue);
+      return;
+    }
+
+    if (
+      task.status === "running" &&
+      task.workerPid &&
+      !processIsAlive(task.workerPid)
+    ) {
+      task.status = "failed";
+      task.runAfter = null;
+      task.lastError = "visible task terminal closed unexpectedly";
+      clearWorker(task);
+      saveQueue(queue);
+      return;
+    }
+
+    await sleep(1000);
+  }
+}
+
+async function runNextDaemonTask() {
+  let queue = loadQueue();
+  const active = queue.find(
+    task =>
+      task.workerToken &&
+      ["dispatched", "running"].includes(task.status)
+  );
+
+  if (active) {
+    await waitForWorker(active.id, active.workerToken);
+    return true;
+  }
+
+  const task = eligibleTask(queue);
+  if (!task) return false;
+
+  const workerToken = randomUUID();
+  task.status = "dispatched";
+  task.workerToken = workerToken;
+  task.workerPid = null;
+  task.dispatchedAt = Date.now();
+  saveQueue(queue);
+
+  const launched = await launchVisibleWorker(
+    task.id,
+    workerToken,
+    task.cwd
+  );
+
+  if (!launched) {
+    queue = loadQueue();
+    const current = queue.find(item => item.id === task.id);
+
+    if (current?.workerToken === workerToken) {
+      current.status = "failed";
+      current.lastError = "could not open a task terminal";
+      clearWorker(current);
+      saveQueue(queue);
+    }
+
+    return true;
+  }
+
+  await waitForWorker(task.id, workerToken);
   return true;
 }
 
@@ -709,9 +1091,15 @@ async function daemon() {
   }
 
   fs.writeFileSync(DAEMON_PID_FILE, String(process.pid));
+  fs.writeFileSync(
+    DAEMON_META_FILE,
+    JSON.stringify({ pid: process.pid, sourceVersion: SOURCE_VERSION }),
+    "utf8"
+  );
   process.on("exit", () => {
     if (daemonPid() === process.pid) {
       fs.rmSync(DAEMON_PID_FILE, { force: true });
+      fs.rmSync(DAEMON_META_FILE, { force: true });
     }
   });
 
@@ -721,12 +1109,33 @@ async function daemon() {
 
   for (const task of queue) {
     if (task.status === "running") {
+      if (task.workerToken && processIsAlive(task.workerPid)) {
+        continue;
+      }
+
       task.status = "queued";
+      clearWorker(task);
       recovered++;
       changed = true;
     } else if (task.status === "dispatched") {
-      pauseForSession(task);
-      task.lastError = "Codex App accepted the message but did not start it";
+      if (
+        task.workerToken &&
+        (
+          processIsAlive(task.workerPid) ||
+          Date.now() - task.dispatchedAt <= 30000
+        )
+      ) {
+        continue;
+      }
+
+      if (task.workerToken) {
+        task.status = "queued";
+        clearWorker(task);
+      } else {
+        pauseForSession(task);
+        task.lastError = "Codex App accepted the message but did not start it";
+      }
+
       recovered++;
       changed = true;
     } else if (task.status === "waiting_session") {
@@ -760,13 +1169,22 @@ async function daemon() {
 
   while (true) {
     try {
-      const ran = await runOneTask();
+      const ran = await runNextDaemonTask();
 
       if (ran) {
         // Brief pause between tasks.
         await sleep(3000);
       } else {
         await sleep(15000);
+      }
+
+      if (sourceWasUpdated()) {
+        console.log("CQ source changed; restarting the daemon before the next task");
+        fs.rmSync(DAEMON_PID_FILE, { force: true });
+        fs.rmSync(DAEMON_META_FILE, { force: true });
+        const replacementPid = ensureDaemon();
+        console.log(`Updated daemon: ${replacementPid || "failed to start"}`);
+        return;
       }
     } catch (error) {
       console.error(error);
@@ -778,18 +1196,53 @@ async function daemon() {
 function listTasks() {
   const queue = loadQueue();
   let pid = daemonPid();
+  let staleDaemon = Boolean(pid && !daemonUsesCurrentSource(pid));
+  let replacedDaemon = false;
+  const activeTask = queue.some(task =>
+    ["dispatched", "running"].includes(task.status)
+  );
+
+  if (staleDaemon && !activeTask) {
+    try {
+      process.kill(pid);
+    } catch {
+      // The outdated daemon already stopped.
+    }
+
+    fs.rmSync(DAEMON_PID_FILE, { force: true });
+    fs.rmSync(DAEMON_META_FILE, { force: true });
+    pid = null;
+    staleDaemon = false;
+    replacedDaemon = true;
+  }
 
   if (
     !pid &&
     queue.some(task =>
-      ["queued", "running", "waiting_quota"]
+      ["queued", "dispatched", "running", "waiting_quota"]
         .includes(task.status)
     )
   ) {
     pid = ensureDaemon();
   }
 
-  console.log(`Daemon: ${pid ? `RUNNING (${pid})` : "STOPPED"}`);
+  console.log(
+    `Daemon: ${pid ? `RUNNING (${pid})${staleDaemon ? " - UPDATE PENDING" : ""}` : "STOPPED"}`
+  );
+
+  if (replacedDaemon) {
+    console.log(
+      pid
+        ? "The idle outdated daemon was replaced with the current CQ code."
+        : "The idle outdated daemon was retired; the next task will use the current CQ code."
+    );
+  }
+
+  if (staleDaemon) {
+    console.log("The daemon predates the installed CQ code and will not use the new terminal behavior.");
+    console.log("Let the active task finish; the next cq list will retire the outdated daemon.");
+    console.log(`Live output: ${DAEMON_LOG_FILE}`);
+  }
 
   if (queue.length === 0) {
     console.log("Queue is empty");
@@ -829,8 +1282,18 @@ function listTasks() {
       );
     }
 
+    if (task.status === "waiting_quota" && task.nextPrompt) {
+      console.log("  next: resume the same session after quota resets");
+    }
+
     if (task.lastError) {
       console.log(`  reason: ${task.lastError}`);
+    }
+
+    if (task.status === "dispatched") {
+      console.log("  terminal: opening");
+    } else if (task.status === "running" && task.workerPid) {
+      console.log(`  terminal: visible (worker ${task.workerPid})`);
     }
 
     if (task.status === "paused_session") {
@@ -851,6 +1314,19 @@ if (
   import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href
 ) {
 switch (command) {
+  case "__worker": {
+    const [taskId, workerToken] = args;
+    const ran = await runOneTask(taskId, workerToken);
+
+    if (!ran) {
+      process.exitCode = 1;
+      break;
+    }
+
+    await sleep(3000);
+    break;
+  }
+
   case "add": {
     let parsed;
 
@@ -1006,8 +1482,8 @@ switch (command) {
       process.exit(1);
     }
 
-    if (task.status === "running") {
-      console.error(`Task ${task.id} is running and cannot be marked done`);
+    if (["dispatched", "running"].includes(task.status)) {
+      console.error(`Task ${task.id} is active and cannot be marked done`);
       process.exit(1);
     }
 
@@ -1105,10 +1581,13 @@ export {
   retryable,
   requeue,
   completeTask,
+  waitForQuota,
   codexInvocation,
   parseApproval,
   approvalArgs,
   parseRetryAt,
   quotaRetryAtFromSnapshot,
-  parseArgs
+  parseArgs,
+  eligibleTask,
+  workerCommand
 };

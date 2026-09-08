@@ -8,12 +8,15 @@ import {
   retryable,
   requeue,
   completeTask,
+  waitForQuota,
   codexInvocation,
   parseApproval,
   approvalArgs,
   parseRetryAt,
   quotaRetryAtFromSnapshot,
-  parseArgs
+  parseArgs,
+  eligibleTask,
+  workerCommand
 } from "./cq.js";
 
 assert.deepEqual(
@@ -111,6 +114,26 @@ assert.equal(completedTask.runAfter, null);
 assert.equal(completedTask.lastError, null);
 assert.ok(completedTask.completedAt);
 
+const quotaTask = {
+  prompt: "original request",
+  threadId: "session-1",
+  status: "running",
+  workerToken: "secret",
+  workerPid: 123,
+  dispatchedAt: 456
+};
+waitForQuota(quotaTask, 789);
+assert.equal(quotaTask.prompt, "original request");
+assert.equal(quotaTask.threadId, "session-1");
+assert.equal(quotaTask.status, "waiting_quota");
+assert.equal(quotaTask.runAfter, 789);
+assert.match(quotaTask.nextPrompt, /Continue the unfinished work/);
+assert.equal("workerToken" in quotaTask, false);
+
+const quotaTaskWithoutSession = { prompt: "not started", status: "running" };
+waitForQuota(quotaTaskWithoutSession, 789);
+assert.equal("nextPrompt" in quotaTaskWithoutSession, false);
+
 assert.deepEqual(
   codexInvocation({ threadId: "abc", prompt: "continue" }),
   {
@@ -127,3 +150,21 @@ assert.deepEqual(
   }
 );
 assert.match(codexInvocation({ last: true, prompt: "continue" }).prompt, /continue/);
+assert.equal(
+  codexInvocation(quotaTask).prompt,
+  quotaTask.nextPrompt
+);
+
+assert.equal(
+  eligibleTask([
+    { id: "done", status: "done" },
+    { id: "active", status: "running" },
+    { id: "next", status: "queued" }
+  ]).id,
+  "next"
+);
+
+const worker = workerCommand("task-1", "worker-token");
+assert.equal(worker.title, "CQ Task task-1");
+assert.deepEqual(worker.args.slice(-3), ["__worker", "task-1", "worker-token"]);
+assert.equal(worker.args.some(value => value.includes("original request")), false);

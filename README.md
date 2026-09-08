@@ -35,7 +35,7 @@ npm link
 cq
 ```
 
-No platform-specific dependency is required. Windows uses the npm command shim and hidden processes; Ubuntu uses the executable shebang and detached processes.
+No platform-specific dependency is required. The scheduler daemon stays hidden, while each Codex task opens in a visible terminal by default. On a graphical Ubuntu installation, CQ uses the available terminal emulator. On a headless Ubuntu host, task output falls back to `daemon.log`.
 
 ## Configuration
 
@@ -95,7 +95,7 @@ cq add "Run in a disposable environment" --approval all
 
 | Mode | Behavior |
 | --- | --- |
-| `ask` | Let Codex request approval. Requires an explicit `--session ID`; a hidden non-interactive run cannot be taken over in Desktop. |
+| `ask` | Let Codex request approval. Requires an explicit `--session ID`; the task terminal is visible, but `codex exec` remains non-interactive. |
 | `auto` | Use Codex automatic approval review inside the workspace-write sandbox. This is the default. |
 | `all` | Approve everything by disabling approvals and the sandbox. Use only in an environment you are willing to give full access. |
 
@@ -142,11 +142,30 @@ The common `cq deamon` misspelling is accepted as an alias for `cq daemon`.
 
 CQ reads the structured Codex account rate-limit snapshot and schedules `WAITING_QUOTA` tasks for the exhausted window's `resetsAt` time. Text parsing is used only when that snapshot is unavailable, with a ten-minute safety probe only when neither source contains a reset time.
 
+## Visible task terminals
+
+The daemon is a hidden scheduler, but task execution is visible by default. No additional command or option is required:
+
+```text
+cq add "Run all tests and fix failures"
+```
+
+When the task reaches the front of the queue, CQ opens a terminal titled with the task ID. The terminal shows the original request, session ID, Codex messages, commands, progress, completion, and errors. CQ passes only an internal task ID and one-time worker token on the terminal command line; it reads the actual prompt from the queue file so shell quoting cannot change the request.
+
+Windows asks Windows Terminal to create a separate window and explicitly runs Windows `cmd.exe` followed by the native Node worker. It does not rely on the configured default profile, so a customized default such as WSL cannot change the worker into a Linux process. If Windows Terminal is unavailable, CQ falls back to a new native console window. Graphical Ubuntu systems try `$TERMINAL`, `x-terminal-emulator`, GNOME Terminal, Konsole, Kitty, Alacritty, and xterm. If no graphical terminal is available, execution continues in the background and writes to `daemon.log` so existing headless workflows keep working.
+
+Closing a task terminal interrupts only that task. CQ records the unexpected worker exit as `FAILED`; other queue entries remain available, and the failed task can be resumed with the existing `cq retry TASK_ID` command.
+
+If quota is exhausted after work has started, CQ preserves the original request and the captured session ID. At the reset time it opens another visible terminal, resumes that same session, and sends a short continuation instruction. Ordinary tasks added with `--session` still receive exactly the prompt supplied by the user; CQ adds continuation wording only after a run was interrupted by quota.
+
+The daemon records the CQ source version it loaded. If CQ is updated while a task is running, that task is allowed to finish under its original daemon. The daemon then restarts itself before selecting another task, so newly installed terminal behavior applies without interrupting an active Codex session. `cq list` reports `UPDATE PENDING` for a legacy or outdated daemon and shows the background log path for the task that is already running.
+
 ## Task states
 
 | State | Meaning | What to do |
 | --- | --- | --- |
 | `QUEUED` | Ready to run | Nothing |
+| `DISPATCHED` | A visible task terminal is opening | Wait for the worker to start |
 | `RUNNING` | Codex is executing the task | Nothing |
 | `WAITING_QUOTA` | The account usage limit was reached | Wait; retry is automatic at the displayed time |
 | `PAUSED_SESSION` | The session is open in another Codex process | Fully quit Codex Desktop or the terminal that owns it, then run the displayed `cq retry TASK_ID` command |
@@ -163,15 +182,19 @@ flowchart TD
     D -- No --> E[Start hidden daemon]
     D -- Yes --> F[Select next eligible task]
     E --> F
-    F --> G{Explicit session ID?}
+    F --> T[Open a visible task terminal]
+    T --> U[Worker claims the task]
+    U --> G{Explicit session ID?}
     G -- Yes --> R[Resume the requested session non-interactively]
     R --> H
     G -- No --> H[Run Codex CLI non-interactively]
     H --> I{Result}
     I -- Success --> J[DONE]
-    I -- Usage limit --> K[Mark pending tasks WAITING_QUOTA]
+    I -- Usage limit --> K[Preserve session and mark tasks WAITING_QUOTA]
     K --> L[Wait until reset time]
-    L --> F
+    L --> V[Open a new visible terminal]
+    V --> W[Resume the same session with a continuation instruction]
+    W --> H
     I -- Session active elsewhere --> M[Pause only this task as PAUSED_SESSION]
     M --> N[User closes the other Codex task]
     N --> O[cq retry TASK_ID]
@@ -188,11 +211,15 @@ Run `npm link` from the `codex-queue` directory. The target project does not nee
 
 ### A session is paused
 
-`cq list` prints the session conflict and the exact retry command. Fully quit Codex Desktop or the terminal that owns the session before retrying it. Reopen Desktop after CQ finishes. If you need live interaction and permission prompts, run `codex resume SESSION_ID` directly instead of using the hidden queue.
+`cq list` prints the session conflict and the exact retry command. Fully quit Codex Desktop or the other terminal that owns the session before retrying it. The visible CQ task terminal is the supported way to monitor an automatic run. If you need interactive control, wait for CQ to release the session and run `codex resume SESSION_ID` directly.
 
 ### The daemon stops
 
 `cq add` starts it automatically. `cq list` also restarts it when runnable work exists. Inspect `daemon.log` under `CQ_HOME` for errors.
+
+### No task terminal opens on Ubuntu
+
+CQ requires `DISPLAY` or `WAYLAND_DISPLAY` and an installed terminal emulator to open a graphical window. On a headless host, the task still runs and writes its output to `daemon.log`.
 
 ## Development
 
